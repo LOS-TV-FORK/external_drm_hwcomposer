@@ -19,9 +19,12 @@
 #include "ResourceManager.h"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <ctime>
 #include <sstream>
+#include <thread>
 
 #include "bufferinfo/BufferInfoGetter.h"
 #include "drm/DrmAtomicStateManager.h"
@@ -135,6 +138,15 @@ void ResourceManager::UpdateFrontendDisplays() {
     auto connected = conn->IsConnected();
     auto attached = attached_pipelines_.count(conn) != 0;
 
+    /* Connected but still no modes: do not bind HEADLESS 1024x768 (garbled).
+     * A later HOTPLUG or deferred retry will attach once KMS populates modes. */
+    if (connected && !attached && conn->GetModes().empty()) {
+      ALOGW("Deferring attach of %s: KMS reported 0 modes",
+            conn->GetName().c_str());
+      ScheduleModesRetry();
+      continue;
+    }
+
     if (connected != attached) {
       ALOGI("%s connector %s", connected ? "Attaching" : "Detaching",
             conn->GetName().c_str());
@@ -167,6 +179,44 @@ void ResourceManager::DetachAllFrontendDisplays() {
   }
   attached_pipelines_.clear();
   frontend_interface_->FinalizeDisplayBinding();
+}
+
+void ResourceManager::ScheduleModesRetry() {
+  bool expected = false;
+  if (!modes_retry_pending_.compare_exchange_strong(expected, true)) {
+    return;
+  }
+
+  /* USB-C DP on Intel xe often raises HOTPLUG before modes/EDID are ready.
+   * Retry attach off the compositor lock so we don't freeze SurfaceFlinger. */
+  std::thread([this] {
+    constexpr int kMaxDeferredRetries = 8;
+    constexpr useconds_t kRetryDelayUs = 500000;
+    for (int i = 0; i < kMaxDeferredRetries; ++i) {
+      usleep(kRetryDelayUs);
+      const std::unique_lock lock(GetMainLock());
+      if (!initialized_) {
+        break;
+      }
+      ALOGI("Retrying frontend display update after deferred modes wait (%d/%d)",
+            i + 1, kMaxDeferredRetries);
+      UpdateFrontendDisplays();
+
+      bool still_waiting = false;
+      for (auto *conn : GetOrderedConnectors()) {
+        if (conn->IsConnected() && conn->IsExternal() &&
+            conn->GetModes().empty() &&
+            attached_pipelines_.count(conn) == 0) {
+          still_waiting = true;
+          break;
+        }
+      }
+      if (!still_waiting) {
+        break;
+      }
+    }
+    modes_retry_pending_ = false;
+  }).detach();
 }
 
 auto ResourceManager::GetOrderedConnectors() -> std::vector<DrmConnector *> {

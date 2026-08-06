@@ -77,6 +77,7 @@ class ResourceManager {
   auto GetOrderedConnectors() -> std::vector<DrmConnector *>;
   void UpdateFrontendDisplays();
   void DetachAllFrontendDisplays();
+  void ScheduleModesRetry();
 
   std::vector<std::unique_ptr<DrmDevice>> drms_;
 
@@ -94,5 +95,6 @@ class ResourceManager {
   PipelineToFrontendBindingInterface *const frontend_interface_;
 
   bool initialized_{};
+  std::atomic<bool> modes_retry_pending_{false};
 };
 }  // namespace android

@@ -271,6 +271,11 @@ int DrmConnector::UpdateModes() {
     }
   }
 
+  if (IsConnected() && IsExternal() && modes_.empty()) {
+    ALOGW("Connector %s is connected but KMS reported 0 modes",
+          GetName().c_str());
+  }
+
   return 0;
 }
 

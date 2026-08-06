@@ -55,9 +55,10 @@ void UEventListener::ThreadFn(const std::shared_ptr<UEventListener> &uel) {
     auto hotplug_event = uevent_str->find("HOTPLUG=1") != std::string::npos;
 
     if (drm_event && hotplug_event) {
-      constexpr useconds_t kDelayAfterUeventUs = 200000;
+      /* USB-C DP / Intel xe need longer than RPI4's 200ms before modes appear. */
+      constexpr useconds_t kDelayAfterUeventUs = 500000;
       /* We need some delay to ensure DrmConnector::UpdateModes() will query
-       * correct modes list, otherwise at least RPI4 board may report 0 modes */
+       * correct modes list, otherwise boards may report 0 modes */
       usleep(kDelayAfterUeventUs);
       hotplug_handler_();
     }
