@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
+#include <cstring>
 #include <sstream>
 
 #include "DrmDevice.h"
@@ -228,6 +229,62 @@ std::string DrmConnector::GetName() const {
   return "None";
 }
 
+namespace {
+
+/* Parse one EDID 18-byte detailed timing descriptor into a KMS mode. */
+bool ParseEdidDetailedTiming(const uint8_t *d, drmModeModeInfo *out) {
+  const uint16_t pixel_clock_10khz = static_cast<uint16_t>(d[0] | (d[1] << 8));
+  if (pixel_clock_10khz == 0) {
+    return false;
+  }
+
+  const uint16_t hactive = static_cast<uint16_t>(d[2] | ((d[4] & 0xf0) << 4));
+  const uint16_t hblank = static_cast<uint16_t>(d[3] | ((d[4] & 0x0f) << 8));
+  const uint16_t vactive = static_cast<uint16_t>(d[5] | ((d[7] & 0xf0) << 4));
+  const uint16_t vblank = static_cast<uint16_t>(d[6] | ((d[7] & 0x0f) << 8));
+  const uint16_t hsync_off = static_cast<uint16_t>(d[8] |
+                                                   ((d[11] & 0xc0) << 2));
+  const uint16_t hsync_width = static_cast<uint16_t>(d[9] |
+                                                    ((d[11] & 0x30) << 4));
+  const uint16_t vsync_off = static_cast<uint16_t>(((d[10] >> 4) & 0x0f) |
+                                                  ((d[11] & 0x0c) << 2));
+  const uint16_t vsync_width = static_cast<uint16_t>((d[10] & 0x0f) |
+                                                    ((d[11] & 0x03) << 4));
+
+  if (hactive == 0 || vactive == 0 || hblank == 0 || vblank == 0) {
+    return false;
+  }
+
+  memset(out, 0, sizeof(*out));
+  out->clock = pixel_clock_10khz * 10;
+  out->hdisplay = hactive;
+  out->hsync_start = hactive + hsync_off;
+  out->hsync_end = hactive + hsync_off + hsync_width;
+  out->htotal = hactive + hblank;
+  out->vdisplay = vactive;
+  out->vsync_start = vactive + vsync_off;
+  out->vsync_end = vactive + vsync_off + vsync_width;
+  out->vtotal = vactive + vblank;
+  if (out->htotal > 0 && out->vtotal > 0) {
+    out->vrefresh = static_cast<uint32_t>(
+        (static_cast<uint64_t>(out->clock) * 1000) /
+        (static_cast<uint64_t>(out->htotal) * out->vtotal));
+  }
+  const uint8_t features = d[17];
+  if (features & 0x80) {
+    out->flags |= DRM_MODE_FLAG_INTERLACE;
+  }
+  if ((features & 0x18) == 0x18) {
+    out->flags |= (features & 0x04) ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC;
+    out->flags |= (features & 0x02) ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC;
+  }
+  out->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+  snprintf(out->name, DRM_DISPLAY_MODE_LEN, "%dx%d", hactive, vactive);
+  return true;
+}
+
+}  // namespace
+
 int DrmConnector::UpdateModes() {
   char value[PROPERTY_VALUE_MAX];
   uint32_t xres = 0, yres = 0, rate = 0;
@@ -268,6 +325,33 @@ int DrmConnector::UpdateModes() {
       }
       modes_.emplace_back(&connector_->modes[i]);
       ALOGD("add new mode %dx%d@%.1f for connector %d", m.GetRawMode().hdisplay, m.GetRawMode().vdisplay, m.GetVRefresh(), GetId());
+    }
+  }
+
+  /* Intel xe + USB-C/DP often exposes EDID while count_modes stays 0. Without a
+   * userspace mode, our hotplug defer path never attaches the display. */
+  if (IsConnected() && IsExternal() && modes_.empty()) {
+    auto edid_blob = GetEdidBlob();
+    if (edid_blob && edid_blob->length >= 128) {
+      const auto *edid = static_cast<const uint8_t *>(edid_blob->data);
+      constexpr int kDtdOffsets[] = {54, 72, 90, 108};
+      for (int off : kDtdOffsets) {
+        drmModeModeInfo mi{};
+        if (!ParseEdidDetailedTiming(edid + off, &mi)) {
+          continue;
+        }
+        if (xres && yres) {
+          if (mi.hdisplay != xres || mi.vdisplay != yres ||
+              (rate && mi.vrefresh != rate)) {
+            continue;
+          }
+        }
+        modes_.emplace_back(&mi);
+        ALOGW("Synthesized EDID mode %dx%d@%u for %s (KMS reported 0 modes)",
+              mi.hdisplay, mi.vdisplay, mi.vrefresh, GetName().c_str());
+        /* Prefer the first detailed timing (EDID preferred mode). */
+        break;
+      }
     }
   }
 
