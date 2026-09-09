@@ -271,13 +271,30 @@ auto HwcDisplay::QueueConfig(hwc2_config_t config, int64_t desired_time,
 }
 
 void HwcDisplay::SetPipeline(std::shared_ptr<DrmDisplayPipeline> pipeline) {
+  const bool had_pipeline = pipeline_ != nullptr;
+  const bool is_primary = handle_ == kPrimaryDisplay;
+
   Deinit();
 
   pipeline_ = std::move(pipeline);
 
-  if (pipeline_ != nullptr || handle_ == kPrimaryDisplay) {
+  if (pipeline_ != nullptr || is_primary) {
     Init();
-    hwc_->ScheduleHotplugEvent(handle_, DrmHwc::kConnected);
+    /* Primary stays connected across physical->headless. Re-firing HOTPLUG
+     * CONNECTED forces SF/WM DisplayInfo transitions; with the default
+     * HEADLESS 1024x768 that becomes a resize + ScreenshotFreezer path that
+     * can block under the HWC main lock and trip system_server Watchdog
+     * (soft reboot / bootanimation). Keep prior configs (see
+     * ChosePreferredConfig) and refresh only when entering headless.
+     */
+    const bool entered_headless = is_primary && had_pipeline &&
+                                  pipeline_ == nullptr;
+    if (entered_headless) {
+      ALOGI("Primary entered headless mode; retaining configs, refresh only");
+      hwc_->SendRefreshEventToClient(handle_);
+    } else {
+      hwc_->ScheduleHotplugEvent(handle_, DrmHwc::kConnected);
+    }
   } else {
     hwc_->ScheduleHotplugEvent(handle_, DrmHwc::kDisconnected);
   }
@@ -360,8 +377,15 @@ HWC2::Error HwcDisplay::ChosePreferredConfig() {
     configs_.GenFakeMode(virtual_disp_width_, virtual_disp_height_);
   } else if (!IsInHeadlessMode()) {
     err = configs_.Update(*pipeline_->connector->Get());
-  } else {
+  } else if (configs_.hwc_configs.empty()) {
+    /* Boot with no connector: synthesize a placeholder mode. */
     configs_.GenFakeMode(0, 0);
+  } else {
+    /* Unplug of last display: keep last physical modes so WM does not see a
+     * 1920x1080->1024x768 DisplayInfo change (Watchdog / ScreenshotFreezer).
+     */
+    ALOGI("Headless primary: retaining %zu prior config(s) (active=%u)",
+          configs_.hwc_configs.size(), configs_.active_config_id);
   }
   if (!IsInHeadlessMode() && err != HWC2::Error::None) {
     return HWC2::Error::BadDisplay;
