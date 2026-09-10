@@ -243,6 +243,12 @@ class HwcDisplay {
 
   std::shared_ptr<DrmDisplayPipeline> pipeline_;
 
+  /* Set when primary enters headless while retaining prior physical configs
+   * (hotplug unplug). Distinguishes that from boot headless + GenFakeMode so
+   * first attach still HOTPLUGs and Update()s modes.
+   */
+  bool retained_physical_configs_for_headless_ = false;
+
   std::unique_ptr<Backend> backend_;
   std::shared_ptr<FlatteningController> flatcon_;
 

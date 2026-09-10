@@ -19,7 +19,13 @@
 
 #include "HwcDisplay.h"
 
+#include <cerrno>
 #include <cinttypes>
+#include <cstring>
+#include <fcntl.h>
+#include <linux/vt.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <hardware/gralloc.h>
 #include <ui/GraphicBufferAllocator.h>
@@ -270,28 +276,100 @@ auto HwcDisplay::QueueConfig(hwc2_config_t config, int64_t desired_time,
   return ConfigError::kNone;
 }
 
+namespace {
+
+/* After headless unplug, fbcon often owns the CRTC (console on HDMI). Reclaim
+ * graphics VT before modeset so setDesiredDisplayModeSpecs does not block.
+ * Android x86 typically runs SurfaceFlinger on VT 7.
+ */
+void ReclaimGraphicsVt(int vt_num = 7) {
+  /* vtcon1/bind is root-writable only; ask init to unbind fbcon, then wait. */
+  property_set("vendor.hwc.drm.reclaim_vt", "1");
+  for (int i = 0; i < 50; i++) {
+    int bind_rd = open("/sys/class/vtconsole/vtcon1/bind", O_RDONLY | O_CLOEXEC);
+    if (bind_rd >= 0) {
+      char val = '1';
+      if (read(bind_rd, &val, 1) == 1 && val == '0') {
+        close(bind_rd);
+        break;
+      }
+      close(bind_rd);
+    }
+    usleep(10000);
+  }
+
+  /* Best-effort direct write if privileges ever allow it. */
+  int bind_wr = open("/sys/class/vtconsole/vtcon1/bind", O_WRONLY | O_CLOEXEC);
+  if (bind_wr >= 0) {
+    if (write(bind_wr, "0", 1) < 0) {
+      ALOGW("Failed to unbind vtcon1: %s", strerror(errno));
+    }
+    close(bind_wr);
+  }
+
+  /* Needs composer in group system (ueventd: /dev/tty0 0660 root system). */
+  int fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    fd = open("/dev/console", O_RDWR | O_CLOEXEC);
+  }
+  if (fd < 0) {
+    ALOGW("ReclaimGraphicsVt: cannot open console (%s)", strerror(errno));
+  } else {
+    if (ioctl(fd, VT_ACTIVATE, vt_num) < 0) {
+      ALOGW("ReclaimGraphicsVt: VT_ACTIVATE %d failed: %s", vt_num,
+            strerror(errno));
+    } else if (ioctl(fd, VT_WAITACTIVE, vt_num) < 0) {
+      ALOGW("ReclaimGraphicsVt: VT_WAITACTIVE %d failed: %s", vt_num,
+            strerror(errno));
+    } else {
+      ALOGI("ReclaimGraphicsVt: switched to VT %d", vt_num);
+    }
+    close(fd);
+  }
+}
+
+}  // namespace
+
 void HwcDisplay::SetPipeline(std::shared_ptr<DrmDisplayPipeline> pipeline) {
   const bool had_pipeline = pipeline_ != nullptr;
   const bool is_primary = handle_ == kPrimaryDisplay;
+  /* Only treat as leave-headless when we previously retained physical modes
+   * across unplug. First boot is also null→pipeline and must HOTPLUG + Update.
+   */
+  const bool leaving_retained_headless = is_primary && !had_pipeline &&
+                                         pipeline != nullptr &&
+                                         retained_physical_configs_for_headless_;
 
   Deinit();
 
   pipeline_ = std::move(pipeline);
 
   if (pipeline_ != nullptr || is_primary) {
+    /* Reclaim graphics VT before Init/modeset when leaving retained headless. */
+    if (leaving_retained_headless) {
+      ReclaimGraphicsVt();
+    }
     Init();
-    /* Primary stays connected across physical->headless. Re-firing HOTPLUG
-     * CONNECTED forces SF/WM DisplayInfo transitions; with the default
-     * HEADLESS 1024x768 that becomes a resize + ScreenshotFreezer path that
-     * can block under the HWC main lock and trip system_server Watchdog
-     * (soft reboot / bootanimation). Keep prior configs (see
-     * ChosePreferredConfig) and refresh only when entering headless.
+    /* Primary stays connected across physical↔headless. Synchronous HOTPLUG
+     * CONNECTED while the HWC main lock is held deadlocks SF's display thread
+     * in setDesiredDisplayModeSpecs (Watchdog soft-reboot). Keep configs stable
+     * (ChosePreferredConfig) and refresh only for enter/leave of retained
+     * headless — not for first boot attach.
      */
     const bool entered_headless = is_primary && had_pipeline &&
                                   pipeline_ == nullptr;
-    if (entered_headless) {
-      ALOGI("Primary entered headless mode; retaining configs, refresh only");
+    if (entered_headless || leaving_retained_headless) {
+      ALOGI("Primary %s headless; retaining configs, refresh only",
+            entered_headless ? "entered" : "left");
       hwc_->SendRefreshEventToClient(handle_);
+      if (leaving_retained_headless) {
+        retained_physical_configs_for_headless_ = false;
+        /* Refresh alone leaves a black frame + cursor trails; kick SF once
+         * the pipeline is back (init checks DRM connected + unbinds vtcon).
+         */
+        ALOGI("Primary left headless; requesting SurfaceFlinger reattach kick");
+        property_set("vendor.hwc.drm.reattach_ui", "1");
+      }
     } else {
       hwc_->ScheduleHotplugEvent(handle_, DrmHwc::kConnected);
     }
@@ -376,16 +454,28 @@ HWC2::Error HwcDisplay::ChosePreferredConfig() {
   if (type_ == HWC2::DisplayType::Virtual) {
     configs_.GenFakeMode(virtual_disp_width_, virtual_disp_height_);
   } else if (!IsInHeadlessMode()) {
-    err = configs_.Update(*pipeline_->connector->Get());
+    /* Reattach after retained headless: keep SF-facing config IDs stable.
+     * Update() regenerates IDs and causes LocalDisplayAdapter "mode id -1".
+     * First boot (or boot after GenFakeMode) must still Update().
+     */
+    if (retained_physical_configs_for_headless_ &&
+        !configs_.hwc_configs.empty()) {
+      ALOGI("Leaving headless: retaining %zu prior config(s) (active=%u)",
+            configs_.hwc_configs.size(), configs_.active_config_id);
+    } else {
+      err = configs_.Update(*pipeline_->connector->Get());
+    }
   } else if (configs_.hwc_configs.empty()) {
     /* Boot with no connector: synthesize a placeholder mode. */
     configs_.GenFakeMode(0, 0);
+    retained_physical_configs_for_headless_ = false;
   } else {
     /* Unplug of last display: keep last physical modes so WM does not see a
      * 1920x1080->1024x768 DisplayInfo change (Watchdog / ScreenshotFreezer).
      */
     ALOGI("Headless primary: retaining %zu prior config(s) (active=%u)",
           configs_.hwc_configs.size(), configs_.active_config_id);
+    retained_physical_configs_for_headless_ = true;
   }
   if (!IsInHeadlessMode() && err != HWC2::Error::None) {
     return HWC2::Error::BadDisplay;
