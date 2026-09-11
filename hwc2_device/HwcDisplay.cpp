@@ -362,12 +362,20 @@ void HwcDisplay::SetPipeline(std::shared_ptr<DrmDisplayPipeline> pipeline) {
       ALOGI("Primary %s headless; retaining configs, refresh only",
             entered_headless ? "entered" : "left");
       hwc_->SendRefreshEventToClient(handle_);
+      if (entered_headless) {
+        /* Pause apps like screen-off; init holds PARTIAL_WAKE_LOCK so the
+         * machine does not deep-sleep. Processes stay alive for signage /
+         * media / games.
+         */
+        ALOGI("Primary entered headless; requesting display suspend");
+        property_set("vendor.hwc.drm.display_suspended", "1");
+      }
       if (leaving_retained_headless) {
         retained_physical_configs_for_headless_ = false;
-        /* Refresh alone leaves a black frame + cursor trails; kick SF once
-         * the pipeline is back (init checks DRM connected + unbinds vtcon).
+        /* State-preserving resume: init unbinds vtcon, wakes display, soft
+         * invalidate. Do not restart SurfaceFlinger (zygote/bootanimation).
          */
-        ALOGI("Primary left headless; requesting SurfaceFlinger reattach kick");
+        ALOGI("Primary left headless; requesting state-preserving UI resume");
         property_set("vendor.hwc.drm.reattach_ui", "1");
       }
     } else {
