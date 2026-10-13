@@ -160,6 +160,21 @@ void ResourceManager::UpdateFrontendDisplays() {
           attached_pipelines_[conn] = std::move(pipeline);
         }
       } else {
+        /*
+         * Single-connector TV (HDMI/DP): on hotplug disconnect the teardown
+         * commits are rejected by amdgpu DC (-22) and the torn hardware
+         * repaints garbage after re-attach (green left half / black right
+         * half on Raven) until something forces a full revalidation. Keep
+         * the attached pipeline alive on its last frame instead of
+         * detaching it; presents simply continue and pick up seamlessly
+         * on return.
+         */
+        if (Properties::IgnoreHotplugDisconnect() && conn->IsExternal()) {
+          ALOGI("%s connector disconnected, keeping pipeline attached "
+                "(ignore_hotplug_disconnect)",
+                conn->GetName().c_str());
+          continue;
+        }
         auto &pipeline = attached_pipelines_[conn];
         frontend_interface_->UnbindDisplay(pipeline);
         attached_pipelines_.erase(conn);
