@@ -28,6 +28,14 @@ const std::vector<std::string> BackendManager::kClientDevices = {
     "kirin",
     "mediatek-drm",
     "pl111",
+    /*
+     * Raven/Vega8 (DCN1): RGBA overlay planes come out with a green
+     * tint over the left half of the screen (pipe-split output stage;
+     * GLES readback of the same buffers is clean, primary-plane client
+     * composition is clean). Bypass Device composition entirely and
+     * composite on the GPU until the DC overlay path is fixed.
+     */
+    "amdgpu",
 };
 
 BackendManager &BackendManager::GetInstance() {
