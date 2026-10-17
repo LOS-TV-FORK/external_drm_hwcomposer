@@ -52,9 +52,14 @@ namespace {
 // Caller must free the returned buffer with GraphicBufferAllocator::free.
 auto GetModesetBuffer(uint32_t width, uint32_t height) -> buffer_handle_t {
   constexpr PixelFormat format = PIXEL_FORMAT_RGBA_8888;
+  // SW-only usage: resolves to a LINEAR combo in minigbm (no DRI modifiers),
+  // which the display core accepts universally and which is always CPU
+  // mappable for the memset below. HW_COMPOSER/HW_FB usage pulls DRI tiled
+  // modifiers whose geometry constraints (e.g. DCC alignment) can fail the
+  // allocation outright for some modes (observed: 1280x720 -> error 5),
+  // leaving the modeset commit without a plane and failing it with -22.
   constexpr uint64_t usage = GRALLOC_USAGE_SW_READ_OFTEN |
-                             GRALLOC_USAGE_SW_WRITE_OFTEN |
-                             GRALLOC_USAGE_HW_COMPOSER | GRALLOC_USAGE_HW_FB;
+                             GRALLOC_USAGE_SW_WRITE_OFTEN;
 
   constexpr uint32_t layer_count = 1;
   const std::string name = "drm-hwcomposer";
@@ -201,6 +206,11 @@ HwcDisplay::ConfigError HwcDisplay::SetConfig(hwc2_config_t config) {
   const uint32_t width = new_config->mode.GetRawMode().hdisplay;
   const uint32_t height = new_config->mode.GetRawMode().vdisplay;
 
+  ALOGI("SetConfig entry: config=%u (active=%u) new=%ux%u cur=%ux%u", config,
+        configs_.active_config_id, width, height,
+        current_config ? current_config->mode.GetRawMode().hdisplay : 0,
+        current_config ? current_config->mode.GetRawMode().vdisplay : 0);
+
   std::optional<LayerData> modeset_layer_data;
   // If a client layer has already been provided, and its size matches the
   // new config, use it for the modeset.
@@ -223,8 +233,6 @@ HwcDisplay::ConfigError HwcDisplay::SetConfig(hwc2_config_t config) {
   }
 
   ALOGV("Create modeset commit.");
-  // Create atomic commit args for a blocking modeset. There's no need to do a
-  // separate test commit, since the commit does a test anyways.
   AtomicCommitArgs commit_args = CreateModesetCommit(new_config,
                                                      modeset_layer_data);
   commit_args.blocking = true;
@@ -238,6 +246,16 @@ HwcDisplay::ConfigError HwcDisplay::SetConfig(hwc2_config_t config) {
   ALOGV("Blocking config succeeded.");
   configs_.active_config_id = config;
   staged_mode_config_id_.reset();
+  // The client layer is scanned out as the primary plane and its display frame is only
+  // refreshed on the staged-mode path in CreateComposition(). A direct setActiveConfig()
+  // goes through here instead, so without this the plane keeps the destination rect of
+  // the previous mode: a 1920x1080 framebuffer gets presented into the old 1360x768
+  // rectangle and the rest of the screen shows the CRTC background.
+  client_layer_.SetLayerDisplayFrame(
+      (hwc_rect_t){.left = 0,
+                   .top = 0,
+                   .right = static_cast<int>(width),
+                   .bottom = static_cast<int>(height)});
   vsync_worker_->SetVsyncPeriodNs(new_config->mode.GetVSyncPeriodNs());
   // set new vsync period
   return ConfigError::kNone;

@@ -1070,6 +1070,8 @@ ndk::ScopedAStatus ComposerClient::setActiveConfigWithConstraints(
     const VsyncPeriodChangeConstraints& constraints,
     VsyncPeriodChangeTimeline* timeline) {
   DEBUG_FUNC();
+  ALOGI("setActiveConfigWithConstraints entry: display=%" PRId64 " config=%d",
+        display_id, config);
   const std::unique_lock lock(hwc_->GetResMan().GetMainLock());
   HwcDisplay* display = GetDisplay(display_id);
   if (display == nullptr) {

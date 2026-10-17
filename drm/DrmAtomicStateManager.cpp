@@ -26,6 +26,7 @@
 #include <utils/Trace.h>
 
 #include <cassert>
+#include <cerrno>
 
 #include "drm/DrmCrtc.h"
 #include "drm/DrmDevice.h"
@@ -200,6 +201,36 @@ auto DrmAtomicStateManager::CommitFrame(AtomicCommitArgs &args) -> int {
     }
 
     CleanupPriorFrameResources();
+  }
+
+  if (args.display_mode && args.blocking && !args.test_only) {
+    // Bounded modeset: a blocking modeset commit waits in the kernel for
+    // flip completion with no timeout. If the sink re-handshakes mid-modeset
+    // (link lost, flip event never arrives) the caller hangs forever and the
+    // system wedges. Commit nonblocking and wait on the present fence with a
+    // timeout instead: on timeout fail gracefully (old mode state retained,
+    // system stays alive and debuggable) instead of hanging.
+    flags |= DRM_MODE_ATOMIC_NONBLOCK;
+    int err = drmModeAtomicCommit(*drm->GetFd(), pset.get(), flags, drm);
+    if (err != 0) {
+      ALOGE("Failed to commit modeset pset ret=%d\n", err);
+      return err;
+    }
+    args.out_fence = MakeSharedFd(out_fence);
+    if (out_fence < 0) {
+      ALOGW("Modeset commit gave no present fence, proceeding");
+      active_frame_state_ = std::move(new_frame_state);
+      return 0;
+    }
+    constexpr int kModesetPresentTimeoutMs = 3000;
+    err = sync_wait(*args.out_fence, kModesetPresentTimeoutMs);
+    if (err != 0) {
+      ALOGE("Modeset present wait timed out (%dms, errno %d), keeping old mode",
+            kModesetPresentTimeoutMs, errno);
+      return -ETIMEDOUT;
+    }
+    active_frame_state_ = std::move(new_frame_state);
+    return 0;
   }
 
   if (nonblock) {
